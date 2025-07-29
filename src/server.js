@@ -25,7 +25,7 @@ const PORT = process.env.PORT || 3000;
 async function registerBasePlugins() {
   await fastify.register(cors, { origin: true });
   await fastify.register(sensible);
-  await fastify.register(multipart);
+  await fastify.register(require('@fastify/multipart'), { attachFieldsToBody: false });
 
   await fastify.register(swagger, {
     openapi: {
@@ -46,7 +46,9 @@ async function registerBasePlugins() {
         { name: 'shopping-lists', description: 'Lista de compras inteligente' },
         { name: 'body-measurements', description: 'Medições corporais e fotos' },
         { name: 'goals', description: 'Metas, lembretes e gamificação' },
-        { name: 'media', description: 'Galeria e uploads (Cloudinary)' },
+        { name: 'media', description: 'Galeria de fotos e vídeos (Cloudinary), tags, comparação' },
+        { name: 'albums', description: 'Álbuns de mídia' },
+        { name: 'measurements', description: 'Medições corporais e progresso' },
         { name: 'timers', description: 'Cronômetros e timers' },
       ],
       components: {
@@ -73,7 +75,7 @@ async function registerProjectPlugins() {
   await fastify.register(require('./plugins/auth'));
 
   // Integrações externas — deixe comentado até configurarmos as fases correspondentes:
-  // await fastify.register(require('./plugins/cloudinary'));
+  await fastify.register(require('./plugins/cloudinary'));
   // await fastify.register(require('./plugins/onesignal'));
   // await fastify.register(require('./plugins/spoonacular'));
 }
@@ -118,7 +120,8 @@ async function registerRoutes() {
   await fastify.register(require('./routes/workoutTemplates'), { prefix: API_PREFIX });
 
   // 6) Dashboard/Estatísticas/Insights
-  // await fastify.register(require('./routes/stats'), { prefix: API_PREFIX });
+  await fastify.register(require('./routes/stats'), { prefix: API_PREFIX });
+  await fastify.register(require('./routes/dashboard'), { prefix: API_PREFIX });
 
   // 7) Lista de Compras Inteligente
   // await fastify.register(require('./routes/shoppingLists'), { prefix: API_PREFIX });
@@ -130,8 +133,10 @@ async function registerRoutes() {
   // await fastify.register(require('./routes/goals'), { prefix: API_PREFIX });
 
   // 10) Galeria e Mídia (upload via Cloudinary)
-  // await fastify.register(require('./routes/media'), { prefix: API_PREFIX });
 
+  // rotas Media & Measurements
+  await fastify.register(require('./routes/media'), { prefix: API_PREFIX });
+  await fastify.register(require('./routes/measurements'), { prefix: API_PREFIX });
   // 11) Cronômetros e Timers
   // await fastify.register(require('./routes/timers'), { prefix: API_PREFIX });
 }
