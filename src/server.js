@@ -28,7 +28,7 @@ const swaggerUI = require('@fastify/swagger-ui');
 // Base plugins (CORS, sensible, multipart, Swagger/OpenAPI)
 // ---------------------------------------------------------
 async function registerBasePlugins() {
-  // CORS robusto para DEV (localhost, LAN, Codespaces, ngrok, e whitelist via .env)
+  // CORS robusto para DEV (localhost, LAN, Codespaces, ngrok, whitelist via .env)
   await fastify.register(cors, {
     origin: (origin, cb) => {
       // Sem Origin (Swagger local, curl, Postman) -> permitir
@@ -95,6 +95,10 @@ async function registerBasePlugins() {
         { name: 'notifications', description: 'Notificações e dispositivos (OneSignal)' },
         { name: 'reminders', description: 'Lembretes (RRULE) e disparo' },
         { name: 'goals', description: 'Metas, lembretes e gamificação' },
+        { name: 'shopping-lists', description: 'Lista de compras inteligente' },
+        { name: 'timers', description: 'Cronômetros e timers' },
+        { name: 'recipes', description: 'Receitas (Spoonacular): busca, detalhes, nutrição' },
+
       ],
       components: {
         securitySchemes: {
@@ -127,8 +131,17 @@ async function registerProjectPlugins() {
 
   // Integrações externas
   await fastify.register(require('./plugins/cloudinary')); // Upload Cloudinary
-  await fastify.register(require('./plugins/onesignal'));  // Push OneSignal
-  // await fastify.register(require('./plugins/spoonacular')); // Sprint de compras (futuro)
+
+  // OneSignal: real se houver credenciais; senão, NO-OP (sem warnings/erros)
+  if (process.env.ONESIGNAL_APP_ID && process.env.ONESIGNAL_API_KEY) {
+    await fastify.register(require('./plugins/onesignal'));
+    fastify.log.info('🔔 OneSignal: habilitado (credenciais encontradas).');
+  } else {
+    await fastify.register(require('./plugins/onesignal.noop'));
+    fastify.log.info('🔕 OneSignal: desabilitado (usando NO-OP).');
+  }
+  // Spoonacular: real se houver chave; senão, NO-OP (sem warnings/erros)
+   await fastify.register(require('./plugins/spoonacular'));
 }
 
 // ---------------------------------------------------------
@@ -152,28 +165,29 @@ async function registerRoutes() {
   fastify.get('/', async (_, reply) => reply.redirect('/documentation'));
 
   // ===== Rotas da API v1 =====
-  await fastify.register(require('./routes/users'),            { prefix: API_PREFIX });
-  await fastify.register(require('./routes/workouts'),         { prefix: API_PREFIX });
-  await fastify.register(require('./routes/exercises'),        { prefix: API_PREFIX });
-  await fastify.register(require('./routes/workoutLogs'),      { prefix: API_PREFIX });
+  await fastify.register(require('./routes/users'), { prefix: API_PREFIX });
+  await fastify.register(require('./routes/workouts'), { prefix: API_PREFIX });
+  await fastify.register(require('./routes/exercises'), { prefix: API_PREFIX });
+  await fastify.register(require('./routes/workoutLogs'), { prefix: API_PREFIX });
   await fastify.register(require('./routes/workoutTemplates'), { prefix: API_PREFIX });
 
   // Stats + Dashboard
-  await fastify.register(require('./routes/stats'),            { prefix: API_PREFIX });
-  await fastify.register(require('./routes/dashboard'),        { prefix: API_PREFIX });
+  await fastify.register(require('./routes/stats'), { prefix: API_PREFIX });
+  await fastify.register(require('./routes/dashboard'), { prefix: API_PREFIX });
 
   // Notificações / Lembretes / Metas
-  await fastify.register(require('./routes/notifications'),    { prefix: API_PREFIX });
-  await fastify.register(require('./routes/reminders'),        { prefix: API_PREFIX });
-  await fastify.register(require('./routes/goals'),            { prefix: API_PREFIX });
+  await fastify.register(require('./routes/notifications'), { prefix: API_PREFIX });
+  await fastify.register(require('./routes/reminders'), { prefix: API_PREFIX });
+  await fastify.register(require('./routes/goals'), { prefix: API_PREFIX });
 
   // Mídia e Medições
-  await fastify.register(require('./routes/media'),            { prefix: API_PREFIX });
-  await fastify.register(require('./routes/measurements'),     { prefix: API_PREFIX });
+  await fastify.register(require('./routes/media'), { prefix: API_PREFIX });
+  await fastify.register(require('./routes/measurements'), { prefix: API_PREFIX });
 
-  // (Futuro) Lista de compras / timers / etc.
-  // await fastify.register(require('./routes/shoppingLists'), { prefix: API_PREFIX });
-  // await fastify.register(require('./routes/timers'),        { prefix: API_PREFIX });
+  // Lista de compras / timers / etc.
+  await fastify.register(require('./routes/shoppingLists'), { prefix: API_PREFIX });
+  await fastify.register(require('./routes/timers'),        { prefix: API_PREFIX });
+  await fastify.register(require('./routes/recipes'),       { prefix: API_PREFIX });
 }
 
 // ---------------------------------------------------------
