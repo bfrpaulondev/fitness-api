@@ -4,55 +4,100 @@ const bcrypt = require('bcrypt');
 const User = require('../models/user');
 
 module.exports = async function usersRoutes(fastify) {
-  // Schemas Zod
-  const registerSchema = z.object({
+  // Helper: adiciona schema apenas se ainda não existir
+  function addSchemaOnce(id, schemaWithoutId) {
+    const all = fastify.getSchemas(); // objeto com todos os schemas já registados
+    if (!all[id]) {
+      fastify.addSchema({ $id: id, ...schemaWithoutId });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 📘 JSON Schemas (Swagger Models) — agora com namespace "auth.*"
+
+  addSchemaOnce('auth.UserPublic', {
+    type: 'object',
+    properties: {
+      id:    { type: 'string' },
+      name:  { type: 'string' },
+      email: { type: 'string', format: 'email' },
+    },
+    required: ['id', 'name', 'email']
+  });
+
+  addSchemaOnce('auth.AuthRegisterRequest', {
+    type: 'object',
+    properties: {
+      name:     { type: 'string', minLength: 2 },
+      email:    { type: 'string', format: 'email' },
+      password: { type: 'string', minLength: 6 },
+    },
+    required: ['name', 'email', 'password']
+  });
+
+  addSchemaOnce('auth.AuthLoginRequest', {
+    type: 'object',
+    properties: {
+      email:    { type: 'string', format: 'email' },
+      password: { type: 'string', minLength: 6 },
+    },
+    required: ['email', 'password']
+  });
+
+  addSchemaOnce('auth.AuthResponse', {
+    type: 'object',
+    properties: {
+      token: { type: 'string' },
+      user:  { $ref: 'auth.UserPublic#' },
+    },
+    required: ['token', 'user']
+  });
+
+  addSchemaOnce('auth.AuthMeResponse', {
+    type: 'object',
+    properties: {
+      user: { $ref: 'auth.UserPublic#' }
+    },
+    required: ['user']
+  });
+
+  // ---------------------------------------------------------------------------
+  // ✅ Zod (validação de entrada)
+
+  const registerZ = z.object({
     name: z.string().min(2),
     email: z.string().email(),
     password: z.string().min(6),
   });
 
-  const loginSchema = z.object({
+  const loginZ = z.object({
     email: z.string().email(),
     password: z.string().min(6),
   });
 
-  // Registro
+  // ---------------------------------------------------------------------------
+  // 🧭 Rotas
+
+  // POST /auth/register
   fastify.post('/auth/register', {
     schema: {
       tags: ['auth'],
       summary: 'Registrar utilizador',
-      body: {
-        type: 'object',
-        required: ['name', 'email', 'password'],
-        properties: {
-          name: { type: 'string', minLength: 2 },
-          email: { type: 'string', format: 'email' },
-          password: { type: 'string', minLength: 6 },
-        }
-      },
+      body: { $ref: 'auth.AuthRegisterRequest#' },
       response: {
-        201: {
-          type: 'object',
-          properties: {
-            token: { type: 'string' },
-            user: {
-              type: 'object',
-              properties: {
-                id: { type: 'string' },
-                name: { type: 'string' },
-                email: { type: 'string' },
-              }
-            }
-          }
-        }
-      }
-    }
+        201: { $ref: 'auth.AuthResponse#' },
+        400: { type: 'object', properties: { message: { type: 'string' } } },
+        409: { type: 'object', properties: { message: { type: 'string' } } },
+      },
+    },
   }, async (request, reply) => {
-    const parsed = registerSchema.safeParse(request.body);
+    const parsed = registerZ.safeParse(request.body);
     if (!parsed.success) {
       return reply.badRequest(parsed.error.errors.map(e => e.message).join(', '));
     }
-    const { name, email, password } = parsed.data;
+    const name = parsed.data.name.trim();
+    const email = parsed.data.email.trim().toLowerCase();
+    const password = parsed.data.password;
 
     const exists = await User.findOne({ email });
     if (exists) return reply.conflict('E-mail já cadastrado');
@@ -67,46 +112,30 @@ module.exports = async function usersRoutes(fastify) {
 
     return reply.code(201).send({
       token,
-      user: { id: user._id, name: user.name, email: user.email }
+      user: { id: user._id.toString(), name: user.name, email: user.email },
     });
   });
 
-  // Login
+  // POST /auth/login
   fastify.post('/auth/login', {
     schema: {
       tags: ['auth'],
       summary: 'Login do utilizador',
-      body: {
-        type: 'object',
-        required: ['email', 'password'],
-        properties: {
-          email: { type: 'string', format: 'email' },
-          password: { type: 'string', minLength: 6 },
-        }
-      },
+      body: { $ref: 'auth.AuthLoginRequest#' },
       response: {
-        200: {
-          type: 'object',
-          properties: {
-            token: { type: 'string' },
-            user: {
-              type: 'object',
-              properties: {
-                id:   { type: 'string' },
-                name: { type: 'string' },
-                email:{ type: 'string' },
-              }
-            }
-          }
-        }
-      }
-    }
+        200: { $ref: 'auth.AuthResponse#' },
+        400: { type: 'object', properties: { message: { type: 'string' } } },
+        401: { type: 'object', properties: { message: { type: 'string' } } },
+      },
+    },
   }, async (request, reply) => {
-    const parsed = loginSchema.safeParse(request.body);
+    const parsed = loginZ.safeParse(request.body);
     if (!parsed.success) {
       return reply.badRequest(parsed.error.errors.map(e => e.message).join(', '));
     }
-    const { email, password } = parsed.data;
+
+    const email = parsed.data.email.trim().toLowerCase();
+    const password = parsed.data.password;
 
     const user = await User.findOne({ email });
     if (!user) return reply.unauthorized('Credenciais inválidas');
@@ -119,34 +148,26 @@ module.exports = async function usersRoutes(fastify) {
       { expiresIn: '7d' }
     );
 
-    return { token, user: { id: user._id, name: user.name, email: user.email } };
+    return {
+      token,
+      user: { id: user._id.toString(), name: user.name, email: user.email },
+    };
   });
 
-  // Perfil do usuário logado
+  // GET /auth/me (protegida)
   fastify.get('/auth/me', {
     schema: {
       tags: ['auth'],
       summary: 'Dados do utilizador autenticado',
       security: [{ bearerAuth: [] }],
       response: {
-        200: {
-          type: 'object',
-          properties: {
-            user: {
-              type: 'object',
-              properties: {
-                id: { type: 'string' },
-                name: { type: 'string' },
-                email: { type: 'string' },
-              }
-            }
-          }
-        }
-      }
+        200: { $ref: 'auth.AuthMeResponse#' },
+        401: { type: 'object', properties: { message: { type: 'string' } } },
+      },
     },
     preValidation: [fastify.authenticate],
   }, async (request) => {
     const user = await User.findById(request.user.sub).select('name email');
-    return { user: { id: user._id, name: user.name, email: user.email } };
+    return { user: { id: user._id.toString(), name: user.name, email: user.email } };
   });
 };

@@ -23,9 +23,11 @@
     "cloudinary": "^2.7.0",
     "dotenv": "^17.2.1",
     "fastify": "^5.4.0",
+    "fastify-type-provider-zod": "^5.0.2",
     "mongoose": "^8.16.5",
     "onesignal-node": "^3.4.0",
-    "zod": "^4.0.13"
+    "zod": "^4.0.13",
+    "zod-to-json-schema": "^3.24.6"
   },
   "devDependencies": {
     "nodemon": "^3.1.10",

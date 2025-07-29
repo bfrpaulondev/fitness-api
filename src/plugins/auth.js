@@ -13,8 +13,12 @@ module.exports = fp(async function authPlugin(fastify) {
   // Middleware para proteger rotas
   fastify.decorate('authenticate', async (request, reply) => {
     try {
-      await request.jwtVerify(); // popula request.user
+      await request.jwtVerify();
     } catch (err) {
+      request.log.warn(
+        { hasAuthHeader: !!request.headers.authorization, authHeader: request.headers.authorization || null },
+        'JWT verify falhou'
+      );
       return reply.unauthorized('Token inválido ou ausente');
     }
   });
