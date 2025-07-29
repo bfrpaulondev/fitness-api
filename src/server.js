@@ -3,29 +3,72 @@ const path = require('path');
 const dotenv = require('dotenv');
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
-const fastify = require('fastify')({
+const Fastify = require('fastify');
+
+// ===== Config =====
+const API_PREFIX = '/v1';
+const PORT = Number(process.env.PORT) || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
+const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
+
+const fastify = Fastify({
   logger: {
     transport: { target: 'pino-pretty' },
-    level: 'info',
+    level: LOG_LEVEL,
   },
 });
 
-// Plugins base
+// ===== Plugins base =====
 const cors = require('@fastify/cors');
 const sensible = require('@fastify/sensible');
-const multipart = require('@fastify/multipart');
 const swagger = require('@fastify/swagger');
 const swaggerUI = require('@fastify/swagger-ui');
 
-// Prefixo de versão
-const API_PREFIX = '/v1';
-const PORT = process.env.PORT || 3000;
-
-// 🔧 Registra plugins básicos (CORS, Swagger, etc.)
+// ---------------------------------------------------------
+// Base plugins (CORS, sensible, multipart, Swagger/OpenAPI)
+// ---------------------------------------------------------
 async function registerBasePlugins() {
-  await fastify.register(cors, { origin: true });
+  // CORS robusto para DEV (localhost, LAN, Codespaces, ngrok, e whitelist via .env)
+  await fastify.register(cors, {
+    origin: (origin, cb) => {
+      // Sem Origin (Swagger local, curl, Postman) -> permitir
+      if (!origin) return cb(null, true);
+
+      // .env CORS_ORIGINS=csv de origens permitidas
+      const envAllow = (process.env.CORS_ORIGINS || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+
+      const devPatterns = [
+        /^https?:\/\/localhost(:\d+)?$/i,
+        /^https?:\/\/127\.0\.0\.1(:\d+)?$/i,
+        /^https?:\/\/10\.\d+\.\d+\.\d+(:\d+)?$/i,       // rede local
+        /^https?:\/\/192\.168\.\d+\.\d+(:\d+)?$/i,       // rede local
+        /^https?:\/\/.+-?\d+-\d+\.app\.github\.dev$/i,   // GitHub Codespaces
+        /^https?:\/\/.+\.ngrok(-free)?\.app$/i,          // ngrok
+      ];
+
+      const ok =
+        envAllow.includes(origin) ||
+        devPatterns.some(re => re.test(origin));
+
+      cb(null, !!ok);
+    },
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Authorization', 'Content-Type', 'X-Requested-With'],
+    exposedHeaders: ['Content-Length', 'ETag'],
+    credentials: true,
+    maxAge: 86400, // 24h
+  });
+
   await fastify.register(sensible);
-  await fastify.register(require('@fastify/multipart'), { attachFieldsToBody: false });
+
+  // multipart (upload) – usamos request.parts(), então attachFieldsToBody: false
+  await fastify.register(require('@fastify/multipart'), {
+    attachFieldsToBody: false,
+    limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
+  });
 
   await fastify.register(swagger, {
     openapi: {
@@ -35,6 +78,9 @@ async function registerBasePlugins() {
         description: 'API para app de fitness (Fastify + MongoDB + Zod + JWT + Swagger).',
         version: '0.1.0',
       },
+      servers: [
+        { url: process.env.PUBLIC_URL || `http://localhost:${PORT}` },
+      ],
       tags: [
         { name: 'health', description: 'Health check' },
         { name: 'auth', description: 'Autenticação e utilizadores' },
@@ -43,19 +89,19 @@ async function registerBasePlugins() {
         { name: 'workout-logs', description: 'Logs de treino e métricas' },
         { name: 'workout-templates', description: 'Templates de treinos (públicos/privados) e clonagem' },
         { name: 'stats', description: 'Dashboard e estatísticas' },
-        { name: 'shopping-lists', description: 'Lista de compras inteligente' },
-        { name: 'body-measurements', description: 'Medições corporais e fotos' },
-        { name: 'goals', description: 'Metas, lembretes e gamificação' },
         { name: 'media', description: 'Galeria de fotos e vídeos (Cloudinary), tags, comparação' },
         { name: 'albums', description: 'Álbuns de mídia' },
         { name: 'measurements', description: 'Medições corporais e progresso' },
-        { name: 'timers', description: 'Cronômetros e timers' },
+        { name: 'notifications', description: 'Notificações e dispositivos (OneSignal)' },
+        { name: 'reminders', description: 'Lembretes (RRULE) e disparo' },
+        { name: 'goals', description: 'Metas, lembretes e gamificação' },
       ],
       components: {
         securitySchemes: {
           bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
         },
       },
+      // Segurança global (rotas públicas não usam preValidation e continuam acessíveis)
       security: [{ bearerAuth: [] }],
     },
   });
@@ -66,34 +112,37 @@ async function registerBasePlugins() {
   });
 }
 
-// 🧩 Plugins do projeto (DB, JWT, integrações)
+// ---------------------------------------------------------
+// Plugins do projeto (DB, JWT, integrações externas)
+// ---------------------------------------------------------
 async function registerProjectPlugins() {
   // Banco de dados (MongoDB via Mongoose)
   await fastify.register(require('./plugins/db'));
 
+  // Schemas compartilhados (se houver)
+  await fastify.register(require('./plugins/schemas'));
+
   // Autenticação JWT (adiciona fastify.authenticate)
   await fastify.register(require('./plugins/auth'));
 
-  // Integrações externas — deixe comentado até configurarmos as fases correspondentes:
-  await fastify.register(require('./plugins/cloudinary'));
-  // await fastify.register(require('./plugins/onesignal'));
-  // await fastify.register(require('./plugins/spoonacular'));
+  // Integrações externas
+  await fastify.register(require('./plugins/cloudinary')); // Upload Cloudinary
+  await fastify.register(require('./plugins/onesignal'));  // Push OneSignal
+  // await fastify.register(require('./plugins/spoonacular')); // Sprint de compras (futuro)
 }
 
-
-// 🛣️ Rotas
+// ---------------------------------------------------------
+// Rotas
+// ---------------------------------------------------------
 async function registerRoutes() {
-  // Health sempre disponível (fora do prefixo)
+  // Health (pública)
   fastify.get('/health', {
     schema: {
       tags: ['health'],
       response: {
         200: {
           type: 'object',
-          properties: {
-            status: { type: 'string' },
-            uptime: { type: 'number' },
-          },
+          properties: { status: { type: 'string' }, uptime: { type: 'number' } },
         },
       },
     },
@@ -103,56 +152,43 @@ async function registerRoutes() {
   fastify.get('/', async (_, reply) => reply.redirect('/documentation'));
 
   // ===== Rotas da API v1 =====
-
-  // 1) Autenticação/Usuários (já vamos usar na Fase 2)
-  await fastify.register(require('./routes/users'), { prefix: API_PREFIX });
-
-  // 2) Treinos (CRUD completo)
-  await fastify.register(require('./routes/workouts'), { prefix: API_PREFIX });
-
-  // 3) Biblioteca de Exercícios (CRUD)
-  await fastify.register(require('./routes/exercises'), { prefix: API_PREFIX });
-
-  // 4) Logs de treino (métricas, histórico)
-  await fastify.register(require('./routes/workoutLogs'), { prefix: API_PREFIX });
-
-  // 5) Templates de treino (públicos/privados)
+  await fastify.register(require('./routes/users'),            { prefix: API_PREFIX });
+  await fastify.register(require('./routes/workouts'),         { prefix: API_PREFIX });
+  await fastify.register(require('./routes/exercises'),        { prefix: API_PREFIX });
+  await fastify.register(require('./routes/workoutLogs'),      { prefix: API_PREFIX });
   await fastify.register(require('./routes/workoutTemplates'), { prefix: API_PREFIX });
 
-  // 6) Dashboard/Estatísticas/Insights
-  await fastify.register(require('./routes/stats'), { prefix: API_PREFIX });
-  await fastify.register(require('./routes/dashboard'), { prefix: API_PREFIX });
+  // Stats + Dashboard
+  await fastify.register(require('./routes/stats'),            { prefix: API_PREFIX });
+  await fastify.register(require('./routes/dashboard'),        { prefix: API_PREFIX });
 
-  // 7) Lista de Compras Inteligente
+  // Notificações / Lembretes / Metas
+  await fastify.register(require('./routes/notifications'),    { prefix: API_PREFIX });
+  await fastify.register(require('./routes/reminders'),        { prefix: API_PREFIX });
+  await fastify.register(require('./routes/goals'),            { prefix: API_PREFIX });
+
+  // Mídia e Medições
+  await fastify.register(require('./routes/media'),            { prefix: API_PREFIX });
+  await fastify.register(require('./routes/measurements'),     { prefix: API_PREFIX });
+
+  // (Futuro) Lista de compras / timers / etc.
   // await fastify.register(require('./routes/shoppingLists'), { prefix: API_PREFIX });
-
-  // 8) Medidas Corporais (com fotos de progresso)
-  // await fastify.register(require('./routes/bodyMeasurements'), { prefix: API_PREFIX });
-
-  // 9) Metas e Lembretes (gamificação + OneSignal)
-  // await fastify.register(require('./routes/goals'), { prefix: API_PREFIX });
-
-  // 10) Galeria e Mídia (upload via Cloudinary)
-
-  // rotas Media & Measurements
-  await fastify.register(require('./routes/media'), { prefix: API_PREFIX });
-  await fastify.register(require('./routes/measurements'), { prefix: API_PREFIX });
-  // 11) Cronômetros e Timers
-  // await fastify.register(require('./routes/timers'), { prefix: API_PREFIX });
+  // await fastify.register(require('./routes/timers'),        { prefix: API_PREFIX });
 }
 
-// 🚀 Bootstrap
+// ---------------------------------------------------------
+// Bootstrap
+// ---------------------------------------------------------
 (async () => {
   try {
     await registerBasePlugins();
-    await fastify.register(require('./plugins/schemas'));
     await registerProjectPlugins();
     await registerRoutes();
 
     await fastify.ready();
-    fastify.swagger(); // gera/spec carrega o OpenAPI
+    fastify.swagger(); // gera/carrega o OpenAPI
 
-    await fastify.listen({ port: PORT, host: '0.0.0.0' });
+    await fastify.listen({ port: PORT, host: HOST });
     fastify.log.info(`🚀 Server rodando em http://localhost:${PORT}`);
     fastify.log.info(`📘 Swagger em http://localhost:${PORT}/documentation`);
   } catch (err) {
