@@ -1,0 +1,27 @@
+{
+  "name": "fitness-api",
+  "version": "1.0.0",
+  "description": "API em Node.js com Fastify, Zod, MongoDB, JWT e Swagger.   Arquitetura monolítica modular, preparada para integrações (Cloudinary, OneSignal, Spoonacular).",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "nodemon --watch src src/server.js",
+    "start": "node src/server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@fastify/jwt": "^9.1.0",
+    "@fastify/swagger": "^9.5.1",
+    "@fastify/swagger-ui": "^5.2.3",
+    "dotenv": "^17.2.1",
+    "fastify": "^5.4.0",
+    "mongoose": "^8.16.5",
+    "pino-pretty": "^13.0.0",
+    "zod": "^4.0.13"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  }
+}
