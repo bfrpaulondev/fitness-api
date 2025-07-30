@@ -9,7 +9,25 @@ module.exports = async function shoppingListsRoutes(fastify) {
   const normalize = (doc) => JSON.parse(JSON.stringify(doc));
   const normalizeMany = (arr) => JSON.parse(JSON.stringify(arr));
 
-  // --- Helpers ---
+  // =============== Helpers gerais ===============
+  function mapUnit(u) {
+    const u0 = String(u || '').trim().toLowerCase();
+    if (['g', 'gram', 'grams'].includes(u0)) return 'g';
+    if (['kg', 'kilogram', 'kilograms'].includes(u0)) return 'kg';
+    if (['ml', 'milliliter', 'milliliters'].includes(u0)) return 'ml';
+    if (['l', 'liter', 'liters'].includes(u0)) return 'l';
+    if (['tbsp', 'tablespoon'].includes(u0)) return 'colher';
+    if (['tsp', 'teaspoon'].includes(u0)) return 'colher chá';
+    if (['cup', 'cups'].includes(u0)) return 'xícara';
+    if (['slice', 'slices'].includes(u0)) return 'fatia';
+    if (['pinch', 'pinches'].includes(u0)) return 'pitada';
+    if (['clove', 'cloves'].includes(u0)) return 'dente';
+    if (['piece', 'pieces', 'unidade', 'unidades', 'uni', 'un'].includes(u0)) return 'un';
+    return u0 || 'un';
+  }
+  const keyOf = (name, unit) =>
+    `${String(name || '').trim().toLowerCase()}::${mapUnit(unit)}`;
+
   function autoCategory(name = '') {
     const s = String(name || '').toLowerCase();
     const m = [
@@ -44,7 +62,105 @@ module.exports = async function shoppingListsRoutes(fastify) {
     }
   }
 
-  // --- Swagger Schemas (resumo) ---
+  // ========== Agregação de histórico (somente dados do usuário) ==========
+  /**
+   * Agrega histórico dos itens COMPRADOS (purchased=true) do usuário,
+   * retornando um mapa key(name+unit) -> { records[], categoryMode }.
+   *
+   * records: { name, unit, qty, price, unitPrice, store, date, category }
+   *
+   * Filtros:
+   *  - store: restringe a uma loja
+   *  - days: apenas registros dos últimos X dias
+   */
+  async function aggregateUserHistory(userId, { store, days } = {}) {
+    const q = { user: userId, 'items.purchased': true };
+    // Buscamos listas inteiras do usuário; vamos iterar itens
+    const lists = await ShoppingList.find(q)
+      .select('items updatedAt')
+      .lean();
+
+    const map = new Map(); // key -> { records: [], catCount: Map }
+    const since = days ? Date.now() - (Number(days) * 24 * 60 * 60 * 1000) : null;
+
+    for (const l of lists) {
+      for (const it of (l.items || [])) {
+        if (!it.purchased) continue;
+
+        const name = String(it.name || '').trim();
+        const unit = mapUnit(it.unit);
+        if (!name) continue;
+
+        const date = it.updatedAt || it.createdAt || l.updatedAt || new Date();
+        if (since && new Date(date).getTime() < since) continue;
+
+        const recStore = it.store || ''; // opcional
+        if (store && recStore && recStore.toLowerCase() !== String(store).toLowerCase()) continue;
+
+        const qty = Number(it.qty || 0);
+        const price = Number(it.purchasedPrice || 0);
+        if (price <= 0) continue; // só consideramos preços que você inseriu
+
+        const unitPrice = qty > 0 ? price / qty : null;
+
+        const key = keyOf(name, unit);
+        if (!map.has(key)) map.set(key, { records: [], catCount: new Map() });
+        const entry = map.get(key);
+
+        entry.records.push({
+          name, unit, qty, price, unitPrice,
+          store: recStore || null,
+          date: new Date(date),
+          category: it.category || null
+        });
+
+        if (it.category) {
+          const k = it.category.toLowerCase();
+          entry.catCount.set(k, (entry.catCount.get(k) || 0) + 1);
+        }
+      }
+    }
+
+    // Define category "mode" (mais frequente) e ordena por data desc
+    for (const v of map.values()) {
+      v.records.sort((a, b) => new Date(b.date) - new Date(a.date));
+      let bestCat = null, bestCnt = -1;
+      for (const [cat, cnt] of v.catCount.entries()) {
+        if (cnt > bestCnt) { bestCat = cat; bestCnt = cnt; }
+      }
+      v.categoryMode = bestCat || null;
+    }
+    return map;
+  }
+
+  function suggestPrice(records, qtyWanted, strategy = 'median') {
+    const valid = records.filter(r => r.unitPrice && isFinite(r.unitPrice) && r.unitPrice > 0);
+    const fallback = records[0]; // mais recente (já está ordenado)
+    if (valid.length === 0) {
+      // Sem unitPrice (faltou qty no passado) — cai no preço “cheio” do último registro
+      const lastPrice = Number(fallback?.price || 0);
+      if (!qtyWanted || qtyWanted <= 0) return lastPrice;
+      return lastPrice > 0 ? lastPrice * (qtyWanted / (fallback?.qty || 1 || 1)) : 0; // melhor esforço
+    }
+
+    if (strategy === 'last') {
+      const up = valid[0].unitPrice;
+      return Number((up * (qtyWanted || 1)).toFixed(2));
+    }
+
+    if (strategy === 'avg') {
+      const avg = valid.reduce((a, r) => a + r.unitPrice, 0) / valid.length;
+      return Number((avg * (qtyWanted || 1)).toFixed(2));
+    }
+
+    // median (default)
+    const arr = valid.map(r => r.unitPrice).sort((a, b) => a - b);
+    const mid = Math.floor(arr.length / 2);
+    const med = arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2;
+    return Number((med * (qtyWanted || 1)).toFixed(2));
+  }
+
+  // =============== Swagger Schemas (resumo) ===============
   const ItemSchema = {
     $id: 'shopping.Item',
     type: 'object',
@@ -67,10 +183,7 @@ module.exports = async function shoppingListsRoutes(fastify) {
     properties: {
       _id: { type: 'string' }, user: { type: 'string' }, name: { type: 'string' }, year: { type: 'number' }, month: { type: 'number' },
       budget: { type: 'number' },
-      alerts: {
-        type: 'object',
-        properties: { warnPct: { type: 'number' }, errorPct: { type: 'number' }, notify: { type: 'boolean' } }
-      },
+      alerts: { type: 'object', properties: { warnPct: { type: 'number' }, errorPct: { type: 'number' }, notify: { type: 'boolean' } } },
       items: { type: 'array', items: { $ref: 'shopping.Item#' } },
       createdAt: { type: 'string', format: 'date-time' }, updatedAt: { type: 'string', format: 'date-time' }
     },
@@ -106,9 +219,48 @@ module.exports = async function shoppingListsRoutes(fastify) {
     required: ['listId','planned','spent','budget','remaining','status']
   };
 
-  [ItemSchema, ListSchema, PageSchema, SummarySchema].forEach(addOnce);
+  const EstimateReqSchema = {
+    $id: 'shopping.EstimateReq',
+    type: 'object',
+    properties: {
+      strategy: { type: 'string', enum: ['last','median','avg'], default: 'median' },
+      store: { type: 'string' },
+      days: { type: 'integer', minimum: 1 },
+      onlyMissing: { type: 'boolean', default: true }
+    }
+  };
 
-  // --- Zod ---
+  const MealPlanReqSchema = {
+    $id: 'shopping.MealPlanReq',
+    type: 'object',
+    properties: {
+      name: { type: 'string' },
+      year: { type: 'integer' },
+      month: { type: 'integer', minimum: 1, maximum: 12 },
+      budget: { type: 'number' },
+      allowUnknown: { type: 'boolean', default: false },
+      strategy: { type: 'string', enum: ['last','median','avg'], default: 'median' },
+      store: { type: 'string' },
+      days: { type: 'integer', minimum: 1 },
+      plan: {
+        type: 'object',
+        properties: {
+          items: {
+            type: 'array',
+            items: { type: 'object', properties: {
+              name: { type: 'string' }, qty: { type: 'number' }, unit: { type: 'string' }, notes: { type: 'string' }
+            }, required: ['name','qty'] }
+          }
+        },
+        required: ['items']
+      }
+    },
+    required: ['plan']
+  };
+
+  [ItemSchema, ListSchema, PageSchema, SummarySchema, EstimateReqSchema, MealPlanReqSchema].forEach(addOnce);
+
+  // =============== Zod (validação efetiva) ===============
   const itemCreateZ = z.object({
     name: z.string().min(1),
     qty: z.number().nonnegative().optional(),
@@ -145,7 +297,33 @@ module.exports = async function shoppingListsRoutes(fastify) {
 
   const listUpdateZ = listCreateZ;
 
-  // --- CRUD de listas ---
+  const estimateReqZ = z.object({
+    strategy: z.enum(['last','median','avg']).default('median').optional(),
+    store: z.string().optional(),
+    days: z.number().int().min(1).optional(),
+    onlyMissing: z.boolean().default(true).optional()
+  });
+
+  const mealPlanReqZ = z.object({
+    name: z.string().optional(),
+    year: z.number().int().min(2000).max(3000).optional(),
+    month: z.number().int().min(1).max(12).optional(),
+    budget: z.number().nonnegative().optional(),
+    allowUnknown: z.boolean().default(false).optional(),
+    strategy: z.enum(['last','median','avg']).default('median').optional(),
+    store: z.string().optional(),
+    days: z.number().int().min(1).optional(),
+    plan: z.object({
+      items: z.array(z.object({
+        name: z.string().min(1),
+        qty: z.number().nonnegative(),
+        unit: z.string().optional(),
+        notes: z.string().optional()
+      })).min(1)
+    })
+  });
+
+  // =============== CRUD de Listas ===============
   fastify.post('/shopping-lists', {
     schema: {
       tags: ['shopping-lists'],
@@ -259,7 +437,7 @@ module.exports = async function shoppingListsRoutes(fastify) {
     return reply.code(204).send();
   });
 
-  // --- Itens ---
+  // =============== Itens ===============
   fastify.post('/shopping-lists/:id/items', {
     schema: {
       tags: ['shopping-lists'],
@@ -285,6 +463,7 @@ module.exports = async function shoppingListsRoutes(fastify) {
 
     const payload = { ...parsed.data };
     if (!payload.category) payload.category = autoCategory(payload.name);
+    payload.unit = mapUnit(payload.unit);
 
     list.items.push(payload);
     await list.save();
@@ -324,6 +503,7 @@ module.exports = async function shoppingListsRoutes(fastify) {
 
     Object.assign(item, parsed.data);
     if (parsed.data.name && !parsed.data.category) item.category = autoCategory(parsed.data.name);
+    if (parsed.data.unit) item.unit = mapUnit(parsed.data.unit);
 
     await list.save();
     const raw = await ShoppingList.findById(list._id).lean();
@@ -351,35 +531,39 @@ module.exports = async function shoppingListsRoutes(fastify) {
     return reply.code(204).send();
   });
 
-  // --- Histórico de preços por item ---
-  fastify.post('/shopping-lists/:id/items/:itemId/price', {
+  // Histórico de preços por item (busca global por nome)
+  fastify.get('/shopping-lists/prices/search', {
     schema: {
       tags: ['shopping-lists'],
       security: [{ bearerAuth: [] }],
-      params: {
-        type: 'object',
-        properties: { id: { type: 'string' }, itemId: { type: 'string' } },
-        required: ['id','itemId']
-      },
-      body: { type: 'object', properties: { date: { type: 'string', format: 'date-time' }, store: { type: 'string' }, price: { type: 'number' } }, required: ['price'] },
-      response: { 200: { $ref: 'shopping.List#' } }
+      querystring: { type: 'object', properties: { name: { type: 'string' }, store: { type: 'string' } }, required: ['name'] }
     }
-  }, async (request, reply) => {
-    const { id, itemId } = request.params;
-    const { date, store, price } = request.body || {};
-    const list = await ShoppingList.findOne({ _id: id, user: request.user.sub });
-    if (!list) return reply.notFound('Lista não encontrada');
+  }, async (request) => {
+    const { name, store } = request.query || {};
+    const lists = await ShoppingList.find({ user: request.user.sub, 'items.name': new RegExp(name, 'i') })
+      .select('items')
+      .lean();
 
-    const item = list.items.id(itemId);
-    if (!item) return reply.notFound('Item não encontrado');
-
-    item.priceHistory.push({ date: date ? new Date(date) : new Date(), store: store || '', price: Number(price) });
-    await list.save();
-    const raw = await ShoppingList.findById(list._id).lean();
-    return normalize(raw);
+    const results = [];
+    for (const l of lists) {
+      for (const it of (l.items || [])) {
+        if (!new RegExp(name, 'i').test(it.name)) continue;
+        for (const ph of (it.priceHistory || [])) {
+          if (store && (!ph.store || ph.store.toLowerCase() !== store.toLowerCase())) continue;
+          results.push({
+            itemName: it.name,
+            store: ph.store || '',
+            date: ph.date instanceof Date ? ph.date.toISOString() : ph.date,
+            price: ph.price
+          });
+        }
+      }
+    }
+    results.sort((a,b) => new Date(b.date) - new Date(a.date));
+    return { name, store: store || null, count: results.length, history: results };
   });
 
-  // --- Sumário / orçamento ---
+  // =============== Sumário / orçamento ===============
   fastify.get('/shopping-lists/:id/summary', {
     schema: {
       tags: ['shopping-lists'],
@@ -418,162 +602,133 @@ module.exports = async function shoppingListsRoutes(fastify) {
     return { listId: String(list._id), planned, spent, budget, remaining, status, byCategory };
   });
 
-  // --- Gerar itens da lista a partir de receitas Spoonacular ---
-  fastify.post('/shopping-lists/:id/from-recipes', {
+  // =============== NOVO: Estimar plannedPrice com base no histórico do usuário ===============
+  fastify.post('/shopping-lists/:id/estimate-prices', {
     schema: {
       tags: ['shopping-lists'],
       security: [{ bearerAuth: [] }],
       params: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
-      body: {
-        type: 'object',
-        properties: {
-          recipeIds: { type: 'array', items: { type: 'integer' } },
-          servingsPerRecipe: { type: 'integer', minimum: 1, default: 1 },
-          overwriteExisting: { type: 'boolean', default: false } // se true, substitui qty de itens com mesmo nome
-        },
-        required: ['recipeIds']
-      }
+      body: { $ref: 'shopping.EstimateReq#' },
+      response: { 200: { $ref: 'shopping.List#' } }
     }
   }, async (request, reply) => {
-    if (!fastify.spoonacularEnabled) {
-      return reply.code(501).send({ message: 'Spoonacular não configurado no servidor (.env).' });
-    }
-    const { id } = request.params;
-    const { recipeIds, servingsPerRecipe = 1, overwriteExisting = false } = request.body || {};
-    if (!Array.isArray(recipeIds) || recipeIds.length === 0) return reply.badRequest('recipeIds deve conter ao menos um id.');
+    const opts = estimateReqZ.safeParse(request.body || {});
+    if (!opts.success) return reply.badRequest(opts.error.errors.map(e => e.message).join(', '));
+    const { strategy = 'median', store, days, onlyMissing = true } = opts.data;
 
-    const list = await ShoppingList.findOne({ _id: id, user: request.user.sub });
+    const list = await ShoppingList.findOne({ _id: request.params.id, user: request.user.sub });
     if (!list) return reply.notFound('Lista não encontrada');
 
-    // 1) Busca info de cada receita (com extendedIngredients)
-    const infos = [];
-    for (const rid of recipeIds) {
-      try {
-        const info = await fastify.spoonacular.getRecipeInfo(rid);
-        infos.push(info);
-      } catch (err) {
-        request.log.warn({ err }, `Falha ao obter receita ${rid}`);
-      }
-    }
-    if (!infos.length) return reply.badRequest('Nenhuma receita válida foi retornada pelo Spoonacular.');
+    const hist = await aggregateUserHistory(request.user.sub, { store, days });
 
-    // 2) Consolida ingredientes em um mapa (nome + unidade)
-    //    Preferimos medidas métricas quando disponíveis
-    const keyOf = (name, unit) => `${name.toLowerCase()}::${(unit || '').toLowerCase()}`;
+    for (const it of list.items || []) {
+      // Se onlyMissing, só estima onde plannedPrice está vazio/0/undefined
+      if (onlyMissing && Number(it.plannedPrice || 0) > 0) continue;
 
-    const acc = new Map(); // key -> { name, qty, unit }
-    for (const info of infos) {
-      const factor = Number(servingsPerRecipe) / Number(info.servings || 1);
-      for (const ing of info.extendedIngredients || []) {
-        const name = (ing.name || '').trim() || (ing.original || '').trim();
-        if (!name) continue;
+      const key = keyOf(it.name, it.unit);
+      const h = hist.get(key);
+      if (!h || !h.records.length) continue; // sem histórico seu, pula
 
-        let amount = Number(ing.amount || 0);
-        let unit = String(ing.unit || '').trim();
+      const qtyWanted = Number(it.qty || 1);
+      const price = suggestPrice(h.records, qtyWanted, strategy);
+      it.plannedPrice = price;
 
-        // Tenta usar medidas métricas se existirem
-        if (ing.measures && ing.measures.metric && ing.measures.metric.amount) {
-          amount = Number(ing.measures.metric.amount || amount);
-          unit = String(ing.measures.metric.unitShort || ing.measures.metric.unitLong || unit || '').trim();
-        }
-
-        // Ajusta pela quantidade de porções desejada
-        if (factor && factor !== 1 && amount > 0) {
-          amount = amount * factor;
-        }
-
-        // Normalização simples de unidades comuns
-        const mapUnit = (u) => {
-          const u0 = (u || '').toLowerCase();
-          if (['g','gram','grams'].includes(u0)) return 'g';
-          if (['kg','kilogram','kilograms'].includes(u0)) return 'kg';
-          if (['ml','milliliter','milliliters'].includes(u0)) return 'ml';
-          if (['l','liter','liters'].includes(u0)) return 'l';
-          if (['tbsp','tablespoon'].includes(u0)) return 'colher';
-          if (['tsp','teaspoon'].includes(u0)) return 'colher chá';
-          if (['cup','cups'].includes(u0)) return 'xícara';
-          if (['slice','slices'].includes(u0)) return 'fatia';
-          if (['pinch','pinches'].includes(u0)) return 'pitada';
-          if (['clove','cloves'].includes(u0)) return 'dente';
-          if (['piece','pieces'].includes(u0)) return 'un';
-          return u0 || 'un';
-        };
-        unit = mapUnit(unit);
-
-        const key = keyOf(name, unit);
-        const prev = acc.get(key);
-        const qty = Number(amount || 0);
-
-        if (!prev) acc.set(key, { name, qty, unit, category: autoCategory(name) });
-        else acc.set(key, { ...prev, qty: Number(prev.qty || 0) + qty });
-      }
-    }
-
-    // 3) Aplica na lista (merge com existentes ou overwrite)
-    const byNameUnit = (a, b) =>
-      a.name.trim().toLowerCase() === b.name.trim().toLowerCase() &&
-      (a.unit || '').trim().toLowerCase() === (b.unit || '').trim().toLowerCase();
-
-    const toAdd = Array.from(acc.values());
-    for (const it of toAdd) {
-      const exists = list.items.find(x => byNameUnit(x, it));
-      if (exists) {
-        if (overwriteExisting) {
-          exists.qty = it.qty;
-          if (!exists.category) exists.category = it.category;
-        } else {
-          exists.qty = Number(exists.qty || 0) + Number(it.qty || 0);
-          if (!exists.category) exists.category = it.category;
-        }
-      } else {
-        list.items.push({
-          name: it.name,
-          qty: it.qty,
-          unit: it.unit || 'un',
-          category: it.category || 'outros',
-          plannedPrice: 0,
-          purchasedPrice: 0,
-          purchased: false,
-          store: '',
-          notes: ''
-        });
+      // Preenche categoria se faltando (pela categoria mais frequente do histórico)
+      if (!it.category && h.categoryMode) {
+        it.category = h.categoryMode;
       }
     }
 
     await list.save();
     const raw = await ShoppingList.findById(list._id).lean();
-    return reply.code(200).send(normalize(raw));
+    return normalize(raw);
   });
 
-  // --- Busca global do histórico de preços por nome (entre listas) ---
-  fastify.get('/shopping-lists/prices/search', {
+  // =============== NOVO: Gerar lista a partir de Meal Plan (somente itens já comprados) ===============
+  fastify.post('/shopping-lists/from-mealplan', {
     schema: {
       tags: ['shopping-lists'],
       security: [{ bearerAuth: [] }],
-      querystring: { type: 'object', properties: { name: { type: 'string' }, store: { type: 'string' } }, required: ['name'] }
+      body: { $ref: 'shopping.MealPlanReq#' },
+      response: { 201: { $ref: 'shopping.List#' } }
     }
-  }, async (request) => {
-    const { name, store } = request.query || {};
-    const lists = await ShoppingList.find({ user: request.user.sub, 'items.name': new RegExp(name, 'i') })
-      .select('items')
-      .lean();
+  }, async (request, reply) => {
+    const parsed = mealPlanReqZ.safeParse(request.body || {});
+    if (!parsed.success) return reply.badRequest(parsed.error.errors.map(e => e.message).join(', '));
+    const { name, year, month, budget, allowUnknown = false, strategy = 'median', store, days, plan } = parsed.data;
 
-    const results = [];
-    for (const l of lists) {
-      for (const it of (l.items || [])) {
-        if (!new RegExp(name, 'i').test(it.name)) continue;
-        for (const ph of (it.priceHistory || [])) {
-          if (store && (!ph.store || ph.store.toLowerCase() !== store.toLowerCase())) continue;
-          results.push({
-            itemName: it.name,
-            store: ph.store || '',
-            date: ph.date instanceof Date ? ph.date.toISOString() : ph.date,
-            price: ph.price
+    const now = new Date();
+    const y = year || now.getUTCFullYear();
+    const m = month || now.getUTCMonth() + 1;
+    const listName = name || `Meal Plan ${String(m).padStart(2,'0')}/${y}`;
+
+    // Históricos de compras do usuário
+    const hist = await aggregateUserHistory(request.user.sub, { store, days });
+
+    // Monta itens a partir do plano
+    const itemsToInsert = [];
+    const unknown = [];
+
+    for (const inItem of plan.items || []) {
+      const nm = String(inItem.name || '').trim();
+      const unit = mapUnit(inItem.unit);
+      const qty = Number(inItem.qty || 0);
+
+      const key = keyOf(nm, unit);
+      const h = hist.get(key);
+
+      if (!h || !h.records.length) {
+        if (!allowUnknown) {
+          unknown.push({ name: nm, unit, qty });
+          continue;
+        } else {
+          itemsToInsert.push({
+            name: nm,
+            qty,
+            unit,
+            category: autoCategory(nm),
+            plannedPrice: 0,
+            purchasedPrice: 0,
+            purchased: false,
+            store: '',
+            notes: inItem.notes || ''
           });
+          continue;
         }
       }
+
+      const price = suggestPrice(h.records, qty, strategy);
+      itemsToInsert.push({
+        name: nm,
+        qty,
+        unit,
+        category: h.categoryMode || autoCategory(nm),
+        plannedPrice: price,
+        purchasedPrice: 0,
+        purchased: false,
+        store: store || '',
+        notes: inItem.notes || ''
+      });
     }
-    results.sort((a,b) => new Date(b.date) - new Date(a.date));
-    return { name, store: store || null, count: results.length, history: results };
+
+    if (unknown.length) {
+      return reply.badRequest({
+        message: 'Alguns itens do meal plan não existem no seu histórico de compras.',
+        unknown
+      });
+    }
+
+    const created = await ShoppingList.create({
+      user: request.user.sub,
+      name: listName,
+      year: y,
+      month: m,
+      budget: budget || 0,
+      alerts: {},
+      items: itemsToInsert
+    });
+
+    const raw = await ShoppingList.findById(created._id).lean();
+    return reply.code(201).send(normalize(raw));
   });
 };
