@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "name": "fitness-api",
+  "builds": [
+    { "src": "api/index.js", "use": "@vercel/node" }
+  ],
+  "functions": {
+    "api/index.js": {
+      "memory": 1024,
+      "maxDuration": 30
+    }
+  },
+  "env": {
+    "NODE_ENV": "production",
+    "JWT_SECRET": "@jwt_secret",
+    "MONGO_URI": "@mongo_uri",
+    "CLOUDINARY_CLOUD_NAME": "@cloud_name",
+    "CLOUDINARY_API_KEY": "@cloud_key",
+    "CLOUDINARY_API_SECRET": "@cloud_secret",
+    "CLOUDINARY_FOLDER": "fitness",
+    "ONESIGNAL_APP_ID": "@onesignal_id",
+    "ONESIGNAL_API_KEY": "@onesignal_key",
+    "SPOONACULAR_API_KEY": "@spoonacular"
+  }
+}
