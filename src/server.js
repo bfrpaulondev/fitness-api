@@ -3,109 +3,83 @@ const path = require('path');
 const dotenv = require('dotenv');
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
-const Fastify = require('fastify');
-
-// ===== Config =====
-const API_PREFIX = '/v1';
-const PORT = Number(process.env.PORT) || 3000;
-const HOST = process.env.HOST || '0.0.0.0';
-const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
-
-const fastify = Fastify({
+const fastify = require('fastify')({
   logger: {
     transport: { target: 'pino-pretty' },
-    level: LOG_LEVEL,
+    level: process.env.LOG_LEVEL || 'info',
   },
 });
 
-// ===== Plugins base =====
+// Plugins base
 const cors = require('@fastify/cors');
 const sensible = require('@fastify/sensible');
+const multipart = require('@fastify/multipart');
 const swagger = require('@fastify/swagger');
 const swaggerUI = require('@fastify/swagger-ui');
 
-// ---------------------------------------------------------
-// Base plugins (CORS, sensible, multipart, Swagger/OpenAPI)
-// ---------------------------------------------------------
+const API_PREFIX = '/v1';
+const PORT = Number(process.env.PORT || 3000);
+const HOST = process.env.HOST || '0.0.0.0';
+
+// ---------- Helpers ----------
+function parseOrigins(str) {
+  return String(str || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
 async function registerBasePlugins() {
-  // CORS robusto para DEV (localhost, LAN, Codespaces, ngrok, whitelist via .env)
+  // CORS: dev = libera tudo; prod = restringe por env
+  const isProd = (process.env.NODE_ENV || '').toLowerCase() === 'production';
+  const allowed = parseOrigins(process.env.CORS_ORIGINS);
+
   await fastify.register(cors, {
     origin: (origin, cb) => {
-      // Sem Origin (Swagger local, curl, Postman) -> permitir
+      // chamadas sem origin (ex.: curl, apps nativas) → permitir
       if (!origin) return cb(null, true);
-
-      // .env CORS_ORIGINS=csv de origens permitidas
-      const envAllow = (process.env.CORS_ORIGINS || '')
-        .split(',')
-        .map(s => s.trim())
-        .filter(Boolean);
-
-      const devPatterns = [
-        /^https?:\/\/localhost(:\d+)?$/i,
-        /^https?:\/\/127\.0\.0\.1(:\d+)?$/i,
-        /^https?:\/\/10\.\d+\.\d+\.\d+(:\d+)?$/i,       // rede local
-        /^https?:\/\/192\.168\.\d+\.\d+(:\d+)?$/i,       // rede local
-        /^https?:\/\/.+-?\d+-\d+\.app\.github\.dev$/i,   // GitHub Codespaces
-        /^https?:\/\/.+\.ngrok(-free)?\.app$/i,          // ngrok
-      ];
-
-      const ok =
-        envAllow.includes(origin) ||
-        devPatterns.some(re => re.test(origin));
-
-      cb(null, !!ok);
+      if (!isProd) return cb(null, true); // DEV: libera geral
+      if (allowed.length === 0) return cb(null, false);
+      if (allowed.includes(origin)) return cb(null, true);
+      cb(new Error('CORS: Origin não permitido'), false);
     },
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Authorization', 'Content-Type', 'X-Requested-With'],
-    exposedHeaders: ['Content-Length', 'ETag'],
     credentials: true,
-    maxAge: 86400, // 24h
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    maxAge: 86400,
   });
 
   await fastify.register(sensible);
-
-  // multipart (upload) – usamos request.parts(), então attachFieldsToBody: false
-  await fastify.register(require('@fastify/multipart'), {
-    attachFieldsToBody: false,
-    limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
-  });
+  await fastify.register(multipart, { attachFieldsToBody: false });
 
   await fastify.register(swagger, {
     openapi: {
       openapi: '3.0.0',
       info: {
         title: 'Fitness API',
-        description: 'API para app de fitness (Fastify + MongoDB + Zod + JWT + Swagger).',
-        version: '0.1.0',
+        description:
+          'API para app de fitness (Fastify + MongoDB + Zod + JWT + Swagger). v1',
+        version: '1.0.0',
       },
-      servers: [
-        { url: process.env.PUBLIC_URL || `http://localhost:${PORT}` },
-      ],
       tags: [
         { name: 'health', description: 'Health check' },
         { name: 'auth', description: 'Autenticação e utilizadores' },
-        { name: 'workouts', description: 'Treinos personalizados' },
         { name: 'exercises', description: 'Biblioteca de exercícios' },
+        { name: 'workouts', description: 'Treinos personalizados' },
         { name: 'workout-logs', description: 'Logs de treino e métricas' },
-        { name: 'workout-templates', description: 'Templates de treinos (públicos/privados) e clonagem' },
-        { name: 'stats', description: 'Dashboard e estatísticas' },
-        { name: 'media', description: 'Galeria de fotos e vídeos (Cloudinary), tags, comparação' },
+        { name: 'workout-templates', description: 'Templates de treinos' },
+        { name: 'media', description: 'Galeria (Cloudinary), tags, comparações' },
         { name: 'albums', description: 'Álbuns de mídia' },
         { name: 'measurements', description: 'Medições corporais e progresso' },
-        { name: 'notifications', description: 'Notificações e dispositivos (OneSignal)' },
-        { name: 'reminders', description: 'Lembretes (RRULE) e disparo' },
-        { name: 'goals', description: 'Metas, lembretes e gamificação' },
         { name: 'shopping-lists', description: 'Lista de compras inteligente' },
-        { name: 'timers', description: 'Cronômetros e timers' },
-        { name: 'recipes', description: 'Receitas (Spoonacular): busca, detalhes, nutrição' },
-
+        { name: 'recipes', description: 'Receitas (Spoonacular)' },
+        { name: 'stats', description: 'Dashboard e estatísticas' },
       ],
       components: {
         securitySchemes: {
           bearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
         },
       },
-      // Segurança global (rotas públicas não usam preValidation e continuam acessíveis)
       security: [{ bearerAuth: [] }],
     },
   });
@@ -116,83 +90,101 @@ async function registerBasePlugins() {
   });
 }
 
-// ---------------------------------------------------------
-// Plugins do projeto (DB, JWT, integrações externas)
-// ---------------------------------------------------------
 async function registerProjectPlugins() {
-  // Banco de dados (MongoDB via Mongoose)
+  // DB (Mongo)
   await fastify.register(require('./plugins/db'));
 
-  // Schemas compartilhados (se houver)
-  await fastify.register(require('./plugins/schemas'));
-
-  // Autenticação JWT (adiciona fastify.authenticate)
+  // JWT (adiciona fastify.authenticate)
   await fastify.register(require('./plugins/auth'));
 
-  // Integrações externas
-  await fastify.register(require('./plugins/cloudinary')); // Upload Cloudinary
+  // Cloudinary (upload de mídia)
+  await fastify.register(require('./plugins/cloudinary'));
 
-  // OneSignal: real se houver credenciais; senão, NO-OP (sem warnings/erros)
-  if (process.env.ONESIGNAL_APP_ID && process.env.ONESIGNAL_API_KEY) {
+  // OneSignal (NO-OP se não tiver envs)
+  try {
     await fastify.register(require('./plugins/onesignal'));
-    fastify.log.info('🔔 OneSignal: habilitado (credenciais encontradas).');
-  } else {
-    await fastify.register(require('./plugins/onesignal.noop'));
-    fastify.log.info('🔕 OneSignal: desabilitado (usando NO-OP).');
+  } catch (e) {
+    fastify.log.warn('⚠️ Plugin OneSignal não encontrado. Ignorando.');
   }
-  // Spoonacular: real se houver chave; senão, NO-OP (sem warnings/erros)
-   await fastify.register(require('./plugins/spoonacular'));
+
+  // Spoonacular (desliga com 501 se sem API key)
+  try {
+    await fastify.register(require('./plugins/spoonacular'));
+  } catch (e) {
+    fastify.log.warn('⚠️ Plugin Spoonacular não encontrado. Ignorando.');
+  }
 }
 
-// ---------------------------------------------------------
-// Rotas
-// ---------------------------------------------------------
 async function registerRoutes() {
-  // Health (pública)
-  fastify.get('/health', {
-    schema: {
-      tags: ['health'],
-      response: {
-        200: {
-          type: 'object',
-          properties: { status: { type: 'string' }, uptime: { type: 'number' } },
+  // Health (fora do prefixo)
+  fastify.get(
+    '/health',
+    {
+      schema: {
+        tags: ['health'],
+        response: {
+          200: {
+            type: 'object',
+            properties: { status: { type: 'string' }, uptime: { type: 'number' } },
+          },
         },
       },
     },
-  }, async () => ({ status: 'ok', uptime: process.uptime() }));
+    async () => ({ status: 'ok', uptime: process.uptime() })
+  );
 
   // Redireciona raiz para Swagger
   fastify.get('/', async (_, reply) => reply.redirect('/documentation'));
 
-  // ===== Rotas da API v1 =====
-  await fastify.register(require('./routes/users'), { prefix: API_PREFIX });
-  await fastify.register(require('./routes/workouts'), { prefix: API_PREFIX });
-  await fastify.register(require('./routes/exercises'), { prefix: API_PREFIX });
-  await fastify.register(require('./routes/workoutLogs'), { prefix: API_PREFIX });
-  await fastify.register(require('./routes/workoutTemplates'), { prefix: API_PREFIX });
+  // Schemas globais custom (se existir)
+  try {
+    await fastify.register(require('./plugins/schemas'));
+  } catch (e) {
+    fastify.log.debug('Sem plugins/schemas adicionais.');
+  }
+
+  // ===== Rotas v1 =====
+  const pref = { prefix: API_PREFIX };
+
+  await fastify.register(require('./routes/users'), pref);
+  await fastify.register(require('./routes/exercises'), pref);
+  await fastify.register(require('./routes/workouts'), pref);
+  await fastify.register(require('./routes/workoutLogs'), pref);
+  await fastify.register(require('./routes/workoutTemplates'), pref);
+
+  await fastify.register(require('./routes/media'), pref);
+  await fastify.register(require('./routes/measurements'), pref);
+  await fastify.register(require('./routes/shoppingLists'), pref);
+
+  // Integração receitas (Spoonacular) — se plugin estiver off, rotas retornam 501
+  try {
+    await fastify.register(require('./routes/recipes'), pref);
+  } catch (e) {
+    fastify.log.warn('⚠️ Rotas de recipes não encontradas. Ignorando.');
+  }
 
   // Stats + Dashboard
-  await fastify.register(require('./routes/stats'), { prefix: API_PREFIX });
-  await fastify.register(require('./routes/dashboard'), { prefix: API_PREFIX });
+  await fastify.register(require('./routes/stats'), pref);
+  await fastify.register(require('./routes/dashboard'), pref);
 
-  // Notificações / Lembretes / Metas
-  await fastify.register(require('./routes/notifications'), { prefix: API_PREFIX });
-  await fastify.register(require('./routes/reminders'), { prefix: API_PREFIX });
-  await fastify.register(require('./routes/goals'), { prefix: API_PREFIX });
-
-  // Mídia e Medições
-  await fastify.register(require('./routes/media'), { prefix: API_PREFIX });
-  await fastify.register(require('./routes/measurements'), { prefix: API_PREFIX });
-
-  // Lista de compras / timers / etc.
-  await fastify.register(require('./routes/shoppingLists'), { prefix: API_PREFIX });
-  await fastify.register(require('./routes/timers'),        { prefix: API_PREFIX });
-  await fastify.register(require('./routes/recipes'),       { prefix: API_PREFIX });
+  // (Opcional) Outras áreas — se não existirem, não quebram:
+  const optionalRoutes = [
+    './routes/goals',
+    './routes/notifications',
+    './routes/reminders',
+    './routes/timers',
+  ];
+  for (const r of optionalRoutes) {
+    try {
+      await fastify.register(require(r), pref);
+      fastify.log.info(`Rotas opcionais carregadas: ${r}`);
+    } catch {
+      fastify.log.debug(`Rotas opcionais ausentes: ${r} (ok)`);
+    }
+  }
 }
 
-// ---------------------------------------------------------
-// Bootstrap
-// ---------------------------------------------------------
+// ---------- Bootstrap ----------
 (async () => {
   try {
     await registerBasePlugins();
@@ -200,13 +192,21 @@ async function registerRoutes() {
     await registerRoutes();
 
     await fastify.ready();
-    fastify.swagger(); // gera/carrega o OpenAPI
+    fastify.swagger();
 
     await fastify.listen({ port: PORT, host: HOST });
-    fastify.log.info(`🚀 Server rodando em http://localhost:${PORT}`);
-    fastify.log.info(`📘 Swagger em http://localhost:${PORT}/documentation`);
+    fastify.log.info(`🚀 Server rodando em http://${HOST}:${PORT}`);
+    fastify.log.info(`📘 Swagger em http://${HOST}:${PORT}/documentation`);
   } catch (err) {
     fastify.log.error(err, 'Falha ao iniciar o servidor');
     process.exit(1);
   }
 })();
+
+// Segurança extra em runtime
+process.on('unhandledRejection', (reason) => {
+  fastify.log.error({ reason }, 'Unhandled Rejection');
+});
+process.on('uncaughtException', (err) => {
+  fastify.log.error({ err }, 'Uncaught Exception');
+});

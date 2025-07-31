@@ -5,28 +5,67 @@ const ShoppingList = require('../models/shoppingList');
 module.exports = async function shoppingListsRoutes(fastify) {
   fastify.addHook('preValidation', fastify.authenticate);
 
-  const addOnce = (schema) => { if (!fastify.getSchemas()[schema.$id]) fastify.addSchema(schema); };
-  const normalize = (doc) => JSON.parse(JSON.stringify(doc));
-  const normalizeMany = (arr) => JSON.parse(JSON.stringify(arr));
+  /* ===================================================================
+   * 🔧 UTILIDADES GERAIS (inclui conversões kg↔g e l↔ml)
+   * =================================================================== */
 
-  // =============== Helpers gerais ===============
+  // Mapeamento de unidades → forma canónica e informações de conversão
+  // Grupos:
+  //   weight  → base: g  (g, kg)
+  //   volume  → base: ml (ml, l)
+  //   other   → base: unidade própria (sem conversão genérica)
+  const UNIT_MAP = {
+    // peso
+    g:  { base: 'g',  factor: 1,     group: 'weight' },
+    gram: 'g', grams: 'g',
+    kg: { base: 'g',  factor: 1000,  group: 'weight' },
+
+    // volume
+    ml: { base: 'ml', factor: 1,     group: 'volume' },
+    milliliter: 'ml', milliliters: 'ml',
+    l:  { base: 'ml', factor: 1000,  group: 'volume' },
+    liter: 'l', liters: 'l',
+
+    // outras unidades ficam no grupo "other" sem conversão automática
+    // (xícara, colher, un, fatia, pitada, etc.)
+  };
+
   function mapUnit(u) {
-    const u0 = String(u || '').trim().toLowerCase();
-    if (['g', 'gram', 'grams'].includes(u0)) return 'g';
-    if (['kg', 'kilogram', 'kilograms'].includes(u0)) return 'kg';
-    if (['ml', 'milliliter', 'milliliters'].includes(u0)) return 'ml';
-    if (['l', 'liter', 'liters'].includes(u0)) return 'l';
-    if (['tbsp', 'tablespoon'].includes(u0)) return 'colher';
-    if (['tsp', 'teaspoon'].includes(u0)) return 'colher chá';
-    if (['cup', 'cups'].includes(u0)) return 'xícara';
-    if (['slice', 'slices'].includes(u0)) return 'fatia';
-    if (['pinch', 'pinches'].includes(u0)) return 'pitada';
-    if (['clove', 'cloves'].includes(u0)) return 'dente';
-    if (['piece', 'pieces', 'unidade', 'unidades', 'uni', 'un'].includes(u0)) return 'un';
-    return u0 || 'un';
+    const key = String(u || '').trim().toLowerCase();
+    const r = UNIT_MAP[key];
+    if (!r) return key || 'un';
+    return typeof r === 'string' ? r : key; // devolve a chave canónica
   }
-  const keyOf = (name, unit) =>
-    `${String(name || '').trim().toLowerCase()}::${mapUnit(unit)}`;
+
+  function unitInfo(u) {
+    const canonKey = mapUnit(u);
+    const entry = UNIT_MAP[canonKey];
+    if (entry && typeof entry === 'object') {
+      return { base: entry.base, factor: entry.factor, group: entry.group, canon: canonKey };
+    }
+    return { base: canonKey, factor: 1, group: 'other', canon: canonKey };
+  }
+
+  // Mesmo item = mesmo nome + mesmo GRUPO de unidade (weight, volume, other)
+  const keyOf = (name, unit) => {
+    const ui = unitInfo(unit);
+    return `${String(name || '').trim().toLowerCase()}::${ui.group}`;
+  };
+
+  // Converte uma quantidade para a unidade base do grupo (g ou ml). "other" = sem conversão (factor 1)
+  function toBaseQty(qty, unit) {
+    const ui = unitInfo(unit);
+    const n = Number(qty || 0);
+    return n * ui.factor;
+  }
+
+  // Preço por unidade base (€/g, €/ml ou €/un para "other")
+  function pricePerBase(price, qty, unit) {
+    const baseQty = toBaseQty(qty, unit);
+    return baseQty > 0 ? price / baseQty : null;
+  }
+
+  /* ---------------- restante de helpers (categoria, soma, alerta) ------------- */
 
   function autoCategory(name = '') {
     const s = String(name || '').toLowerCase();
@@ -40,9 +79,7 @@ module.exports = async function shoppingListsRoutes(fastify) {
       { cat: 'higiene',       kw: ['sabão','sabonete','shampoo','pasta de dente','creme dental','papel higiénico','papel higienico'] },
       { cat: 'limpeza',       kw: ['detergente','amaciante','desinfetante','limpa','alvejante','água sanitária'] },
     ];
-    for (const g of m) {
-      if (g.kw.some(k => s.includes(k))) return g.cat;
-    }
+    for (const g of m) { if (g.kw.some(k => s.includes(k))) return g.cat; }
     return 'outros';
   }
 
@@ -62,53 +99,54 @@ module.exports = async function shoppingListsRoutes(fastify) {
     }
   }
 
-  // ========== Agregação de histórico (somente dados do usuário) ==========
+  /* ===================================================================
+   * 📈 AGREGAÇÃO DO HISTÓRICO (purchased=true) COM CONVERSÕES
+   * =================================================================== */
+
   /**
-   * Agrega histórico dos itens COMPRADOS (purchased=true) do usuário,
-   * retornando um mapa key(name+unit) -> { records[], categoryMode }.
-   *
-   * records: { name, unit, qty, price, unitPrice, store, date, category }
-   *
-   * Filtros:
-   *  - store: restringe a uma loja
-   *  - days: apenas registros dos últimos X dias
+   * Retorna um Map:
+   *   key(name+group) -> {
+   *     records: [{ name, unit, qty, baseQty, price, unitPriceBase, store, date, category }],
+   *     categoryMode: 'categoria mais frequente'
+   *   }
+   * Filtros opcionais: { store, days }
    */
   async function aggregateUserHistory(userId, { store, days } = {}) {
-    const q = { user: userId, 'items.purchased': true };
-    // Buscamos listas inteiras do usuário; vamos iterar itens
-    const lists = await ShoppingList.find(q)
+    const lists = await ShoppingList.find({ user: userId, 'items.purchased': true })
       .select('items updatedAt')
       .lean();
 
-    const map = new Map(); // key -> { records: [], catCount: Map }
-    const since = days ? Date.now() - (Number(days) * 24 * 60 * 60 * 1000) : null;
+    const map = new Map();
+    const since = days ? Date.now() - (Number(days) * 86_400_000) : null;
 
     for (const l of lists) {
       for (const it of (l.items || [])) {
         if (!it.purchased) continue;
 
         const name = String(it.name || '').trim();
-        const unit = mapUnit(it.unit);
-        if (!name) continue;
-
-        const date = it.updatedAt || it.createdAt || l.updatedAt || new Date();
-        if (since && new Date(date).getTime() < since) continue;
-
-        const recStore = it.store || ''; // opcional
-        if (store && recStore && recStore.toLowerCase() !== String(store).toLowerCase()) continue;
-
         const qty = Number(it.qty || 0);
         const price = Number(it.purchasedPrice || 0);
-        if (price <= 0) continue; // só consideramos preços que você inseriu
+        const recStore = it.store || '';
+        const date = it.updatedAt || it.createdAt || l.updatedAt || new Date();
 
-        const unitPrice = qty > 0 ? price / qty : null;
+        if (!name || price <= 0 || qty <= 0) continue;
+        if (store && recStore && recStore.toLowerCase() !== String(store).toLowerCase()) continue;
+        if (since && new Date(date).getTime() < since) continue;
 
-        const key = keyOf(name, unit);
+        const key = keyOf(name, it.unit);
         if (!map.has(key)) map.set(key, { records: [], catCount: new Map() });
         const entry = map.get(key);
 
+        const baseQty = toBaseQty(qty, it.unit);
+        if (baseQty <= 0) continue;
+
         entry.records.push({
-          name, unit, qty, price, unitPrice,
+          name,
+          unit: unitInfo(it.unit).canon,
+          qty,
+          baseQty,
+          price,
+          unitPriceBase: price / baseQty, // €/g, €/ml ou €/un (grupo other)
           store: recStore || null,
           date: new Date(date),
           category: it.category || null
@@ -121,9 +159,9 @@ module.exports = async function shoppingListsRoutes(fastify) {
       }
     }
 
-    // Define category "mode" (mais frequente) e ordena por data desc
     for (const v of map.values()) {
       v.records.sort((a, b) => new Date(b.date) - new Date(a.date));
+      // categoria mais frequente
       let bestCat = null, bestCnt = -1;
       for (const [cat, cnt] of v.catCount.entries()) {
         if (cnt > bestCnt) { bestCat = cat; bestCnt = cnt; }
@@ -133,34 +171,46 @@ module.exports = async function shoppingListsRoutes(fastify) {
     return map;
   }
 
-  function suggestPrice(records, qtyWanted, strategy = 'median') {
-    const valid = records.filter(r => r.unitPrice && isFinite(r.unitPrice) && r.unitPrice > 0);
-    const fallback = records[0]; // mais recente (já está ordenado)
+  /**
+   * Gera preço estimado para uma quantidade desejada e unidade desejada,
+   * usando os registros (com unitPriceBase) e estratégia: 'median' | 'last' | 'avg'
+   */
+  function suggestPrice(records, qtyWanted, unitWanted, strategy = 'median') {
+    if (!records || !records.length) return 0;
+
+    const qtyBase = toBaseQty(qtyWanted || 1, unitWanted);
+    const valid = records.filter(r => isFinite(r.unitPriceBase) && r.unitPriceBase > 0);
+
     if (valid.length === 0) {
-      // Sem unitPrice (faltou qty no passado) — cai no preço “cheio” do último registro
-      const lastPrice = Number(fallback?.price || 0);
-      if (!qtyWanted || qtyWanted <= 0) return lastPrice;
-      return lastPrice > 0 ? lastPrice * (qtyWanted / (fallback?.qty || 1 || 1)) : 0; // melhor esforço
+      // Fallback: sem unitPriceBase válido (deveria ser raro)
+      const last = records[0];
+      if (!last || !isFinite(last.baseQty) || last.baseQty <= 0) return 0;
+      const pricePerBaseFallback = last.price / last.baseQty;
+      return Number((pricePerBaseFallback * qtyBase).toFixed(2));
     }
 
-    if (strategy === 'last') {
-      const up = valid[0].unitPrice;
-      return Number((up * (qtyWanted || 1)).toFixed(2));
-    }
+    const pickUnitPrice = () => {
+      if (strategy === 'last') return valid[0].unitPriceBase;
+      if (strategy === 'avg')  return valid.reduce((a, r) => a + r.unitPriceBase, 0) / valid.length;
+      // median (default)
+      const arr = valid.map(r => r.unitPriceBase).sort((a, b) => a - b);
+      const mid = Math.floor(arr.length / 2);
+      return arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2;
+    };
 
-    if (strategy === 'avg') {
-      const avg = valid.reduce((a, r) => a + r.unitPrice, 0) / valid.length;
-      return Number((avg * (qtyWanted || 1)).toFixed(2));
-    }
-
-    // median (default)
-    const arr = valid.map(r => r.unitPrice).sort((a, b) => a - b);
-    const mid = Math.floor(arr.length / 2);
-    const med = arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2;
-    return Number((med * (qtyWanted || 1)).toFixed(2));
+    const up = pickUnitPrice();
+    return Number((up * qtyBase).toFixed(2));
   }
 
-  // =============== Swagger Schemas (resumo) ===============
+  /* ===================================================================
+   * 📦 SCHEMAS (Swagger) + ZOD (validação)
+   * =================================================================== */
+
+  const addOnce = (schema) => { if (!fastify.getSchemas()[schema.$id]) fastify.addSchema(schema); };
+  const normalize = (doc) => JSON.parse(JSON.stringify(doc));
+  const normalizeMany = (arr) => JSON.parse(JSON.stringify(arr));
+
+  // Swagger
   const ItemSchema = {
     $id: 'shopping.Item',
     type: 'object',
@@ -260,7 +310,7 @@ module.exports = async function shoppingListsRoutes(fastify) {
 
   [ItemSchema, ListSchema, PageSchema, SummarySchema, EstimateReqSchema, MealPlanReqSchema].forEach(addOnce);
 
-  // =============== Zod (validação efetiva) ===============
+  // Zod (validação real)
   const itemCreateZ = z.object({
     name: z.string().min(1),
     qty: z.number().nonnegative().optional(),
@@ -323,12 +373,15 @@ module.exports = async function shoppingListsRoutes(fastify) {
     })
   });
 
-  // =============== CRUD de Listas ===============
+  /* ===================================================================
+   * 🧰 CRUD de LISTAS
+   * =================================================================== */
+
   fastify.post('/shopping-lists', {
     schema: {
       tags: ['shopping-lists'],
       security: [{ bearerAuth: [] }],
-      body: { $ref: 'shopping.List#' }, // doc; validação real via zod
+      body: { $ref: 'shopping.List#' }, // doc; validação via zod
       response: { 201: { $ref: 'shopping.List#' } }
     }
   }, async (request, reply) => {
@@ -437,7 +490,10 @@ module.exports = async function shoppingListsRoutes(fastify) {
     return reply.code(204).send();
   });
 
-  // =============== Itens ===============
+  /* ===================================================================
+   * 🧾 ITENS
+   * =================================================================== */
+
   fastify.post('/shopping-lists/:id/items', {
     schema: {
       tags: ['shopping-lists'],
@@ -462,8 +518,8 @@ module.exports = async function shoppingListsRoutes(fastify) {
     if (!list) return reply.notFound('Lista não encontrada');
 
     const payload = { ...parsed.data };
-    if (!payload.category) payload.category = autoCategory(payload.name);
     payload.unit = mapUnit(payload.unit);
+    if (!payload.category) payload.category = autoCategory(payload.name);
 
     list.items.push(payload);
     await list.save();
@@ -531,7 +587,10 @@ module.exports = async function shoppingListsRoutes(fastify) {
     return reply.code(204).send();
   });
 
-  // Histórico de preços por item (busca global por nome)
+  /* ===================================================================
+   * 🔎 BUSCA GLOBAL DE HISTÓRICO DE PREÇOS POR NOME (entre listas)
+   * =================================================================== */
+
   fastify.get('/shopping-lists/prices/search', {
     schema: {
       tags: ['shopping-lists'],
@@ -563,7 +622,10 @@ module.exports = async function shoppingListsRoutes(fastify) {
     return { name, store: store || null, count: results.length, history: results };
   });
 
-  // =============== Sumário / orçamento ===============
+  /* ===================================================================
+   * 📊 SUMÁRIO / ORÇAMENTO
+   * =================================================================== */
+
   fastify.get('/shopping-lists/:id/summary', {
     schema: {
       tags: ['shopping-lists'],
@@ -602,7 +664,10 @@ module.exports = async function shoppingListsRoutes(fastify) {
     return { listId: String(list._id), planned, spent, budget, remaining, status, byCategory };
   });
 
-  // =============== NOVO: Estimar plannedPrice com base no histórico do usuário ===============
+  /* ===================================================================
+   * 💡 ESTIMAR plannedPrice A PARTIR DO SEU HISTÓRICO (com conversão)
+   * =================================================================== */
+
   fastify.post('/shopping-lists/:id/estimate-prices', {
     schema: {
       tags: ['shopping-lists'],
@@ -622,18 +687,16 @@ module.exports = async function shoppingListsRoutes(fastify) {
     const hist = await aggregateUserHistory(request.user.sub, { store, days });
 
     for (const it of list.items || []) {
-      // Se onlyMissing, só estima onde plannedPrice está vazio/0/undefined
       if (onlyMissing && Number(it.plannedPrice || 0) > 0) continue;
 
       const key = keyOf(it.name, it.unit);
       const h = hist.get(key);
-      if (!h || !h.records.length) continue; // sem histórico seu, pula
+      if (!h || !h.records.length) continue;
 
       const qtyWanted = Number(it.qty || 1);
-      const price = suggestPrice(h.records, qtyWanted, strategy);
+      const price = suggestPrice(h.records, qtyWanted, it.unit, strategy);
       it.plannedPrice = price;
 
-      // Preenche categoria se faltando (pela categoria mais frequente do histórico)
       if (!it.category && h.categoryMode) {
         it.category = h.categoryMode;
       }
@@ -644,7 +707,10 @@ module.exports = async function shoppingListsRoutes(fastify) {
     return normalize(raw);
   });
 
-  // =============== NOVO: Gerar lista a partir de Meal Plan (somente itens já comprados) ===============
+  /* ===================================================================
+   * 🧑‍🍳 FROM MEAL PLAN (gera nova lista) — só itens do seu histórico
+   * =================================================================== */
+
   fastify.post('/shopping-lists/from-mealplan', {
     schema: {
       tags: ['shopping-lists'],
@@ -662,10 +728,8 @@ module.exports = async function shoppingListsRoutes(fastify) {
     const m = month || now.getUTCMonth() + 1;
     const listName = name || `Meal Plan ${String(m).padStart(2,'0')}/${y}`;
 
-    // Históricos de compras do usuário
     const hist = await aggregateUserHistory(request.user.sub, { store, days });
 
-    // Monta itens a partir do plano
     const itemsToInsert = [];
     const unknown = [];
 
@@ -697,7 +761,7 @@ module.exports = async function shoppingListsRoutes(fastify) {
         }
       }
 
-      const price = suggestPrice(h.records, qty, strategy);
+      const price = suggestPrice(h.records, qty, unit, strategy);
       itemsToInsert.push({
         name: nm,
         qty,
