@@ -25,8 +25,7 @@ const HOST = process.env.HOST || '0.0.0.0';
 function parseOrigins(str) {
   return String(str || '')
     .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
+    .map(s => s.trim())   .filter(Boolean);
 }
 
 async function registerBasePlugins() {
